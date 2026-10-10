@@ -178,6 +178,7 @@ test('emails are processed oldest first', () => {
   env.sync();
   assert.match(env.promptOf(env.requests[0].body), /Subject: First/);
   assert.match(env.promptOf(env.requests[1].body), /Subject: Second/);
+  assert.ok(env.logs.includes('log: No calendar changes for "First" from Recruiting <recruiting@stripe.com>.'));
 });
 
 test('an OA deadline becomes a zero-length event at the deadline', () => {

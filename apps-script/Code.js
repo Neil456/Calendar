@@ -217,6 +217,7 @@ function sync_() {
       try {
         const email = readEmail_(msg);
         const plan = askModel_(email, events, settings);
+        if (!plan.actions.length) console.log(`No calendar changes for "${email.subject}" from ${email.from}.`);
         applyPlan_(plan, email, events, settings);
         applyInviteChanges_(email, events, settings);
         markDone_(state, msg);
