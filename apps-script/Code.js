@@ -2,19 +2,21 @@
  * Interview Tracker (Google Apps Script)
  *
  * Every 10 minutes this script checks the Gmail account it's installed in for
- * interview and online-assessment (OA) emails. Claude reads each one, and the
- * script keeps one shared "Interviews" Google Calendar in sync: it adds
+ * interview and online-assessment (OA) emails. An AI model reads each one, and
+ * the script keeps one shared "Interviews" Google Calendar in sync: it adds
  * interviews and OA deadlines, moves rescheduled ones, and removes cancelled
  * interviews and submitted OAs. The calendar's own default notifications
  * (1 day and 1 hour before) send the alerts to your phone.
  *
  * Install the same file in each Gmail account. Settings for each account go in
  * Project Settings → Script properties:
- *   ANTHROPIC_API_KEY  required in every account
+ *   GROQ_API_KEY       in every account: a free key from console.groq.com
+ *                      (or ANTHROPIC_API_KEY to use Claude instead, at a small cost)
  *   SHARE_WITH         main account only: your other Gmail addresses, comma-separated
  *   CALENDAR_ID        other accounts only: the ID that setup() printed in your main account
  *   HOME_TIMEZONE      optional: used when an email doesn't say which time zone
  *                      (default: this account's Google Calendar time zone)
+ *   MODEL              optional: a different model ID for whichever provider you use
  *
  * Then run setup() once. See README.md.
  */
@@ -23,31 +25,36 @@ const CONFIG = {
   CALENDAR_NAME: 'Interviews',
   // The phone alerts, set as the calendar's default notifications.
   REMINDER_MINUTES: [24 * 60, 60],
-  MODEL: 'claude-opus-5-5',
-  EFFORT: 'medium',
+  // The model that reads the emails. Groq is used when GROQ_API_KEY is set, Claude otherwise.
+  GROQ_MODEL: 'openai/gpt-oss-120b',
+  GROQ_REASONING_EFFORT: 'medium',
+  CLAUDE_MODEL: 'claude-haiku-5-5',
+  CLAUDE_EFFORT: 'medium',
   TRIGGER_EVERY_MINUTES: 10,
   // How far back each run searches. The first sync (or one after a long pause)
   // looks further back, up to MAX_LOOKBACK_DAYS, to catch interviews that are
   // already scheduled.
   LOOKBACK_DAYS: 3,
-  MAX_LOOKBACK_DAYS: 30,
+  MAX_LOOKBACK_DAYS: 14,
   DEFAULT_INTERVIEW_MINUTES: 60,
-  // Only emails matching at least one of these terms are sent to Claude.
+  // Only emails matching at least one of these terms are sent to the model.
   SEARCH_TERMS: [
     'interview', 'interviews', 'interviewing', 'assessment', 'assessments',
     'coding challenge', 'take-home', 'phone screen', 'technical screen',
     'superday', 'onsite', 'on-site', 'hackerrank', 'codesignal', 'codility',
     'hirevue', 'karat', 'coderpad',
   ],
-  MAX_BODY_CHARS: 15000,
-  MAX_ICS_CHARS: 4000,
+  // Keeps each request inside Groq's free-tier limit of 8,000 tokens a minute.
+  MAX_BODY_CHARS: 8000,
+  MAX_ICS_CHARS: 2000,
   MAX_ACTIONS_PER_EMAIL: 5,
   MAX_ATTEMPTS: 3,
   // Apps Script stops a run at 6 minutes; leave room to save progress.
   RUN_BUDGET_MS: 4.5 * 60 * 1000,
 };
 
-const API_URL = 'https://api.anthropic.com/v1/messages';
+const CLAUDE_URL = 'https://api.anthropic.com/v1/messages';
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 const DONE_PREFIX = 'done:';
@@ -131,8 +138,8 @@ const PLAN_SCHEMA = {
 /** Run once per account. Safe to run again after changing settings. */
 function setup() {
   const props = PropertiesService.getScriptProperties();
-  if (!(props.getProperty('ANTHROPIC_API_KEY') || '').trim()) {
-    throw new Error('Add ANTHROPIC_API_KEY under Project Settings → Script properties, then run setup again.');
+  if (!modelSettings_(props)) {
+    throw new Error('Add GROQ_API_KEY (free, from console.groq.com) under Project Settings → Script properties, then run setup again.');
   }
   const me = Session.getEffectiveUser().getEmail();
   const homeTz = homeTimeZone_(props);
@@ -189,6 +196,7 @@ function syncInterviews() {
 function sync_() {
   const startedAt = Date.now();
   const settings = loadSettings_();
+  settings.deadline = startedAt + CONFIG.RUN_BUDGET_MS;
   const state = PropertiesService.getUserProperties();
   const stored = state.getProperties();
   const lookbackDays = lookbackDays_(stored[LAST_FULL_SYNC], startedAt);
@@ -208,13 +216,13 @@ function sync_() {
       const msg = messages[i];
       try {
         const email = readEmail_(msg);
-        const plan = askClaude_(email, events, settings);
+        const plan = askModel_(email, events, settings);
         applyPlan_(plan, email, events, settings);
         markDone_(state, msg);
       } catch (err) {
         if (err.fatal) throw err;
         if (err.retryLater) {
-          console.warn(`Claude API unavailable (${err.message}); will retry next run.`);
+          console.warn(`${settings.providerName} is busy or rate-limited (${err.message}); will continue next run.`);
           complete = false;
           break;
         }
@@ -240,8 +248,8 @@ function lookbackDays_(lastFullSync, now) {
 
 function loadSettings_() {
   const props = PropertiesService.getScriptProperties();
-  const apiKey = (props.getProperty('ANTHROPIC_API_KEY') || '').trim();
-  if (!apiKey) throw fatal_('ANTHROPIC_API_KEY is missing from Script properties.');
+  const model = modelSettings_(props);
+  if (!model) throw fatal_('GROQ_API_KEY (or ANTHROPIC_API_KEY) is missing from Script properties.');
   const calendarId = (props.getProperty('CALENDAR_ID') || '').trim();
   if (!calendarId) throw fatal_('CALENDAR_ID is missing. Run setup() first.');
   const me = Session.getEffectiveUser().getEmail().toLowerCase();
@@ -251,7 +259,18 @@ function loadSettings_() {
   } catch (e) {
     // Aliases are only used to skip your own replies.
   }
-  return { apiKey: apiKey, calendarId: calendarId, homeTz: homeTimeZone_(props), me: me, myAddresses: myAddresses };
+  return Object.assign(model, { calendarId: calendarId, homeTz: homeTimeZone_(props), me: me, myAddresses: myAddresses });
+}
+
+/** Which provider and model read the emails: Groq if it has a key, otherwise Claude. Null if neither has one. */
+function modelSettings_(props) {
+  const groqKey = (props.getProperty('GROQ_API_KEY') || '').trim();
+  const claudeKey = (props.getProperty('ANTHROPIC_API_KEY') || '').trim();
+  if (!groqKey && !claudeKey) return null;
+  const model = (props.getProperty('MODEL') || '').trim();
+  return groqKey
+    ? { provider: 'groq', providerName: 'Groq', apiKey: groqKey, model: model || CONFIG.GROQ_MODEL }
+    : { provider: 'claude', providerName: 'Claude', apiKey: claudeKey, model: model || CONFIG.CLAUDE_MODEL };
 }
 
 function homeTimeZone_(props) {
@@ -262,7 +281,7 @@ function homeTimeZone_(props) {
 
 function buildQuery_(days) {
   const terms = CONFIG.SEARCH_TERMS.map(function (t) { return /[\s-]/.test(t) ? `"${t}"` : t; });
-  return `newer_than:${days}d -in:sent -in:chats -in:drafts -category:social -category:forums (${terms.join(' OR ')})`;
+  return `newer_than:${days}d -in:sent -in:chats -in:drafts -category:promotions -category:social -category:forums (${terms.join(' OR ')})`;
 }
 
 /** Messages not handled yet, oldest first, so a reschedule is applied after the original invite. */
@@ -320,9 +339,17 @@ function readEmail_(msg) {
     from: msg.getFrom(),
     received: msg.getDate(),
     body: body,
-    inviteTexts: inviteTexts.map(function (t) { return t.slice(0, CONFIG.MAX_ICS_CHARS); }),
+    inviteTexts: inviteTexts.map(inviteForPrompt_),
     invites: parseInvites_(inviteTexts),
   };
+}
+
+/** An invite as shown to the model: without time zone definitions and alarms, which only cost tokens. */
+function inviteForPrompt_(text) {
+  return text
+    .replace(/\r?\n[ \t]/g, '')
+    .replace(/BEGIN:(VTIMEZONE|VALARM)[\s\S]*?END:\1\r?\n?/gi, '')
+    .slice(0, CONFIG.MAX_ICS_CHARS);
 }
 
 /** Calendar invites (.ics) in the email, from attachments and from text/calendar parts of the raw message. */
@@ -473,62 +500,106 @@ function icsZone_(tzid) {
 }
 
 // ---------------------------------------------------------------------------
-// Claude
+// The model
 // ---------------------------------------------------------------------------
 
-function askClaude_(email, events, settings) {
+/** The calendar changes the model wants for this email: {actions: [...]}. */
+function askModel_(email, events, settings) {
+  const prompt = buildPrompt_(email, events, settings);
+  return settings.provider === 'groq' ? askGroq_(prompt, settings) : askClaude_(prompt, settings);
+}
+
+function askGroq_(prompt, settings) {
+  const data = postJson_(GROQ_URL, { Authorization: `Bearer ${settings.apiKey}` }, {
+    model: settings.model,
+    messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: prompt }],
+    response_format: {
+      type: 'json_schema',
+      json_schema: { name: 'calendar_changes', strict: true, schema: PLAN_SCHEMA },
+    },
+    reasoning_effort: CONFIG.GROQ_REASONING_EFFORT,
+    include_reasoning: false,
+    max_completion_tokens: 3000,
+  }, settings);
+  const choice = (data.choices || [])[0];
+  if (!choice || choice.finish_reason !== 'stop') {
+    throw new Error(`Groq stopped early (${choice ? choice.finish_reason : 'no answer'}).`);
+  }
+  return parsePlan_(choice.message.content);
+}
+
+function askClaude_(prompt, settings) {
   const body = {
-    model: CONFIG.MODEL,
+    model: settings.model,
     max_tokens: 16000,
     system: SYSTEM_PROMPT,
-    messages: [{ role: 'user', content: buildPrompt_(email, events, settings) }],
-    output_config: { effort: CONFIG.EFFORT, format: { type: 'json_schema', schema: PLAN_SCHEMA } },
+    messages: [{ role: 'user', content: prompt }],
+    output_config: { effort: CONFIG.CLAUDE_EFFORT, format: { type: 'json_schema', schema: PLAN_SCHEMA } },
   };
   const headers = { 'x-api-key': settings.apiKey, 'anthropic-version': '2023-06-01' };
   // If a safety classifier declines, retry on Anthropic's recommended fallback model.
   // Haiku has no server-side fallback.
-  if (CONFIG.MODEL.indexOf('haiku') === -1) {
+  if (settings.model.indexOf('haiku') === -1) {
     body.fallbacks = 'default';
     headers['anthropic-beta'] = 'server-side-fallback-2026-07-01';
   }
-
-  let res;
-  try {
-    res = UrlFetchApp.fetch(API_URL, {
-      method: 'post',
-      contentType: 'application/json',
-      headers: headers,
-      payload: JSON.stringify(body),
-      muteHttpExceptions: true,
-    });
-  } catch (e) {
-    // Timeouts and network errors: retried a few times, then the email is skipped.
-    throw new Error(`Request failed: ${e.message}`);
-  }
-
-  const status = res.getResponseCode();
-  const text = res.getContentText();
-  if (status === 429 || status >= 500) {
-    const err = new Error(`HTTP ${status}`);
-    err.retryLater = true;
-    throw err;
-  }
-  if (status !== 200) {
-    // Bad key, no credits, or a malformed request. Failing the run makes Google email you about it.
-    throw fatal_(`Claude API error ${status}: ${text.slice(0, 500)}`);
-  }
-
-  const data = JSON.parse(text);
+  const data = postJson_(CLAUDE_URL, headers, body, settings);
   if (data.stop_reason === 'refusal' || data.stop_reason === 'max_tokens') {
     throw new Error(`Claude stopped early (${data.stop_reason}).`);
   }
-  const out = (data.content || [])
+  return parsePlan_((data.content || [])
     .filter(function (b) { return b.type === 'text'; })
     .map(function (b) { return b.text; })
-    .join('');
-  const plan = JSON.parse(out);
-  if (!plan || !Array.isArray(plan.actions)) throw new Error('Claude returned an unexpected shape.');
+    .join(''));
+}
+
+function parsePlan_(text) {
+  const plan = JSON.parse(text);
+  if (!plan || !Array.isArray(plan.actions)) throw new Error('The model returned an unexpected shape.');
   return plan;
+}
+
+/**
+ * POSTs JSON and returns the parsed reply. Waits out short rate limits (Groq's free tier
+ * allows 8,000 tokens a minute) while the run has time left. Errors are tagged for sync_:
+ * `retryLater` stops this run and resumes next time, `fatal` fails the run so Google emails
+ * you, and anything else counts as a failed try for this email.
+ */
+function postJson_(url, headers, body, settings) {
+  for (let attempt = 0; ; attempt++) {
+    let res;
+    try {
+      res = UrlFetchApp.fetch(url, {
+        method: 'post',
+        contentType: 'application/json',
+        headers: headers,
+        payload: JSON.stringify(body),
+        muteHttpExceptions: true,
+      });
+    } catch (e) {
+      throw new Error(`Request failed: ${e.message}`);
+    }
+    const status = res.getResponseCode();
+    const text = res.getContentText();
+    if (status === 200) return JSON.parse(text);
+
+    if (status === 429 || status === 498 || status >= 500) {
+      const responseHeaders = res.getHeaders ? res.getHeaders() : {};
+      const wait = Number(responseHeaders['retry-after'] || responseHeaders['Retry-After']) || 0;
+      if (status === 429 && wait > 0 && wait <= 60 && attempt < 5 && Date.now() + wait * 1000 < settings.deadline) {
+        Utilities.sleep(wait * 1000);
+        continue;
+      }
+      const err = new Error(`HTTP ${status}${wait ? `, retry after ${wait}s` : ''}`);
+      err.retryLater = true;
+      throw err;
+    }
+    if (status === 413 || status === 422) {
+      throw new Error(`${settings.providerName} couldn't handle this email (HTTP ${status}): ${text.slice(0, 300)}`);
+    }
+    // Bad key, no credit, retired model, or a malformed request. Failing the run makes Google email you.
+    throw fatal_(`${settings.providerName} API error ${status}: ${text.slice(0, 500)}`);
+  }
 }
 
 function buildPrompt_(email, events, settings) {
@@ -624,7 +695,7 @@ function applyAction_(a, email, events, settings) {
  * Works out an event's start and end, most reliable source first:
  *   1. an OA deadline given as "within N hours/days": counted from when the email arrived;
  *   2. an interview with a calendar invite: the invite's own time and zone;
- *   3. otherwise Claude's reading of the email.
+ *   3. otherwise the model's reading of the email.
  * The Calendar API is given the wall-clock time and the zone itself, not a precomputed offset,
  * so Google applies daylight saving.
  * Returns null if there is no usable time. `warnings` (a time zone that had to be assumed) make

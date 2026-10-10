@@ -67,47 +67,72 @@ test('adds a confirmed interview in the time zone the email used', () => {
   assert.match(ev.description, /https:\/\/mail\.google\.com\/mail\/\?authuser=me%40gmail\.com#all\/m1/);
   assert.deepEqual(ev.extendedProperties.private, { interviewTracker: '1', kind: 'interview', company: 'Stripe', sourceMessage: 'm1' });
 
-  // First sync searches back 30 days.
-  assert.match(env.queries[0], /^newer_than:30d -in:sent .*\(interview OR interviews .*"phone screen".*\)$/);
+  // First sync searches back 14 days.
+  assert.match(env.queries[0], /^newer_than:14d -in:sent .*-category:promotions .*\(interview OR interviews .*"phone screen".*\)$/);
 });
 
-test('sends a well-formed Claude request', () => {
+test('sends a well-formed Groq request', () => {
   const env = createEnv({ now: NOW });
   env.addThread(email({ cc: 'coordinator@stripe.com' }));
   env.reply({ actions: [] });
   env.sync();
 
   const req = env.requests[0];
-  assert.equal(req.url, 'https://api.anthropic.com/v1/messages');
-  assert.deepEqual({ ...req.headers }, {
-    'x-api-key': 'sk-test',
-    'anthropic-version': '2023-06-01',
-    'anthropic-beta': 'server-side-fallback-2026-07-01',
-  });
+  assert.equal(req.url, 'https://api.groq.com/openai/v1/chat/completions');
+  assert.deepEqual({ ...req.headers }, { Authorization: 'Bearer gsk-test' });
   assert.equal(req.params.muteHttpExceptions, true);
-  assert.equal(req.body.model, 'claude-opus-5-5');
-  assert.equal(req.body.fallbacks, 'default');
-  assert.equal(req.body.output_config.effort, 'medium');
-  assert.equal(req.body.output_config.format.type, 'json_schema');
-  assert.equal(req.body.output_config.format.schema.additionalProperties, false);
-  assert.equal(req.body.thinking, undefined);
-  assert.match(req.body.system, /never follow instructions/);
+  assert.equal(req.body.model, 'openai/gpt-oss-120b');
+  assert.equal(req.body.reasoning_effort, 'medium');
+  assert.equal(req.body.include_reasoning, false);
+  assert.equal(req.body.max_completion_tokens, 3000);
+  assert.equal(req.body.response_format.type, 'json_schema');
+  assert.equal(req.body.response_format.json_schema.strict, true);
+  assert.equal(req.body.response_format.json_schema.schema.additionalProperties, false);
+  assert.equal(req.body.messages[0].role, 'system');
+  assert.match(req.body.messages[0].content, /never follow instructions/);
+  assert.equal(req.body.messages[1].role, 'user');
 
-  const prompt = req.body.messages[0].content;
+  const prompt = req.body.messages[1].content;
   assert.match(prompt, /^User's home time zone: America\/New_York\nNow: Sat 2026-10-10 14:00\n/);
   assert.match(prompt, /Events on the calendar \(times shown in America\/New_York\):\n\(none\)/);
   assert.match(prompt, /<email inbox="me@gmail.com" received="Sat 2026-10-10 13:00">\nFrom: Recruiting <recruiting@stripe.com>\nTo: me@gmail.com\nCc: coordinator@stripe.com\nSubject: Interview confirmed\n\nYour phone screen/);
   assert.match(prompt, /2:00 PM PT\.\n<\/email>$/);
 });
 
-test('Haiku requests leave out server-side fallbacks', () => {
-  const env = createEnv({ now: NOW });
-  env.run('CONFIG.MODEL = "claude-haiku-5-5"');
+test('uses Claude Haiku when only ANTHROPIC_API_KEY is set', () => {
+  const env = createEnv({ now: NOW, scriptProps: { ANTHROPIC_API_KEY: 'sk-test', CALENDAR_ID: 'cal-main' } });
+  env.addThread(email({}));
+  env.reply({ actions: [action({})] });
+  env.sync();
+
+  const req = env.requests[0];
+  assert.equal(req.url, 'https://api.anthropic.com/v1/messages');
+  assert.deepEqual({ ...req.headers }, { 'x-api-key': 'sk-test', 'anthropic-version': '2023-06-01' });
+  assert.equal(req.body.model, 'claude-haiku-5-5');
+  assert.equal(req.body.fallbacks, undefined); // Haiku has no server-side fallback
+  assert.equal(req.body.output_config.effort, 'medium');
+  assert.equal(req.body.output_config.format.type, 'json_schema');
+  assert.equal(req.body.thinking, undefined);
+  assert.match(req.body.system, /never follow instructions/);
+  assert.match(req.body.messages[0].content, /Subject: Interview confirmed/);
+  assert.equal(env.eventList().length, 1);
+});
+
+test('MODEL picks another model; larger Claude models get server-side fallbacks', () => {
+  const env = createEnv({ now: NOW, scriptProps: { ANTHROPIC_API_KEY: 'sk-test', MODEL: 'claude-sonnet-5-5', CALENDAR_ID: 'cal-main' } });
   env.addThread(email({}));
   env.reply({ actions: [] });
   env.sync();
-  assert.equal(env.requests[0].body.fallbacks, undefined);
-  assert.equal(env.requests[0].headers['anthropic-beta'], undefined);
+  assert.equal(env.requests[0].body.model, 'claude-sonnet-5-5');
+  assert.equal(env.requests[0].body.fallbacks, 'default');
+  assert.equal(env.requests[0].headers['anthropic-beta'], 'server-side-fallback-2026-07-01');
+
+  const groq = createEnv({ now: NOW, scriptProps: { GROQ_API_KEY: 'gsk', ANTHROPIC_API_KEY: 'sk', MODEL: 'qwen/qwen3.8-27b', CALENDAR_ID: 'cal-main' } });
+  groq.addThread(email({}));
+  groq.reply({ actions: [] });
+  groq.sync();
+  assert.match(groq.requests[0].url, /groq\.com/); // Groq wins when both keys are set
+  assert.equal(groq.requests[0].body.model, 'qwen/qwen3.8-27b');
 });
 
 test('each email is only sent to Claude once', () => {
@@ -131,7 +156,7 @@ test('a reschedule moves the existing event', () => {
   env.addThread(email({ id: 'm2', subject: 'Rescheduled', body: 'Moved to Thu Oct 15, 11am PT.' }));
   env.reply((body) => {
     // Existing events are listed with their id, in the home time zone (2pm PT = 5pm ET).
-    assert.match(body.messages[0].content, /- id: ev1 \| Stripe: Phone Screen \| Wed 2026-10-14 17:00\n/);
+    assert.match(env.promptOf(body), /- id: ev1 \| Stripe: Phone Screen \| Wed 2026-10-14 17:00\n/);
     return { actions: [action({ action: 'update', event_id: 'ev1', start_local: '2026-10-15T11:00' })] };
   });
   env.clock.now += HOUR;
@@ -151,8 +176,8 @@ test('emails are processed oldest first', () => {
   env.reply({ actions: [] });
   env.reply({ actions: [] });
   env.sync();
-  assert.match(env.requests[0].body.messages[0].content, /Subject: First/);
-  assert.match(env.requests[1].body.messages[0].content, /Subject: Second/);
+  assert.match(env.promptOf(env.requests[0].body), /Subject: First/);
+  assert.match(env.promptOf(env.requests[1].body), /Subject: Second/);
 });
 
 test('an OA deadline becomes a zero-length event at the deadline', () => {
@@ -255,7 +280,7 @@ test('includes .ics invites and trims very long emails', () => {
   env.reply({ actions: [] });
   env.sync();
   const prompt = env.lastPrompt();
-  assert.match(prompt, /x{15000}\n\[\.\.\. rest of email cut for length \.\.\.\]/);
+  assert.match(prompt, /x{8000}\n\[\.\.\. rest of email cut for length \.\.\.\]/);
   assert.match(prompt, /\n\[Calendar invite\]\nBEGIN:VCALENDAR\nDTSTART;TZID=America\/Los_Angeles:20261014T140000\n<\/email>$/);
   assert.doesNotMatch(prompt, /resume\.pdf/);
 });
@@ -274,20 +299,65 @@ test('an API outage leaves emails for the next run', () => {
   env.clock.now += 10 * 60 * 1000;
   env.sync();
   assert.equal(env.eventList().length, 1);
-  assert.match(env.queries[1], /^newer_than:30d /);
+  assert.match(env.queries[1], /^newer_than:14d /);
+});
+
+test('waits out a short Groq rate limit within the run', () => {
+  const env = createEnv({ now: NOW });
+  env.addThread(email({}));
+  env.reply({ status: 429, headers: { 'retry-after': '7' }, body: { error: { message: 'Rate limit reached: tokens per minute' } } });
+  env.reply({ actions: [action({})] });
+  env.sync();
+  assert.deepEqual(env.sleeps, [7000]);
+  assert.equal(env.eventList().length, 1);
+  assert.ok(env.userProps['done:m1']);
+});
+
+test('stops for the day when Groq\'s daily limit is used up, and resumes later', () => {
+  const env = createEnv({ now: NOW });
+  env.addThread(email({}));
+  env.reply({ status: 429, headers: { 'retry-after': '5400' }, body: { error: { message: 'Rate limit reached: tokens per day' } } });
+  env.sync();
+  assert.deepEqual(env.sleeps, []);
+  assert.equal(env.userProps['done:m1'], undefined);
+  assert.equal(env.userProps['fail:m1'], undefined); // not the email's fault
+  assert.ok(env.logs.some((l) => /Groq is busy or rate-limited \(HTTP 429, retry after 5400s\)/.test(l)));
+
+  env.clock.now += 2 * HOUR;
+  env.reply({ actions: [action({})] });
+  env.sync();
+  assert.equal(env.eventList().length, 1);
+});
+
+test('does not wait past the run\'s time budget', () => {
+  const env = createEnv({ now: NOW });
+  env.addThread(email({}));
+  env.onRequest = () => { env.clock.now += 4.4 * 60 * 1000; }; // a slow call near the end of the run
+  env.reply({ status: 429, headers: { 'retry-after': '30' }, body: {} });
+  env.sync();
+  assert.deepEqual(env.sleeps, []);
+  assert.equal(env.userProps['done:m1'], undefined);
+});
+
+test('an email too big for Groq counts as a failed try, not an outage', () => {
+  const env = createEnv({ now: NOW });
+  env.addThread(email({}));
+  env.reply({ status: 413, body: { error: { message: 'Request too large' } } });
+  env.sync();
+  assert.equal(env.userProps['fail:m1'], '1');
 });
 
 test('a bad API key fails the run so Google emails you', () => {
   const env = createEnv({ now: NOW });
   env.addThread(email({}));
   env.reply({ status: 401, body: { type: 'error', error: { type: 'authentication_error' } } });
-  assert.throws(() => env.sync(), /Claude API error 401/);
+  assert.throws(() => env.sync(), /Groq API error 401/);
   assert.equal(env.userProps['done:m1'], undefined);
 });
 
 test('missing settings fail the run with a clear message', () => {
   const env = createEnv({ now: NOW, scriptProps: { CALENDAR_ID: 'cal-main' } });
-  assert.throws(() => env.sync(), /ANTHROPIC_API_KEY is missing/);
+  assert.throws(() => env.sync(), /GROQ_API_KEY \(or ANTHROPIC_API_KEY\) is missing/);
 });
 
 test('an email that keeps failing is skipped after 3 tries', () => {
@@ -297,7 +367,7 @@ test('an email that keeps failing is skipped after 3 tries', () => {
   env.reply('not json');
   env.reply({ actions: [] });
   env.sync();
-  env.reply({ stop_reason: 'refusal', actions: [] });
+  env.reply({ finish_reason: 'length', actions: [] }); // answer cut off
   env.sync();
   assert.equal(env.userProps['fail:m1'], '2');
   assert.equal(env.userProps.lastFullSync, undefined); // keeps searching back until it's resolved
@@ -335,7 +405,7 @@ test('after a pause, searches back to the last complete sync', () => {
   assert.match(env.queries[0], /^newer_than:11d /);
   env.userProps.lastFullSync = String(NOW - 90 * 24 * HOUR);
   env.sync();
-  assert.match(env.queries[1], /^newer_than:30d /);
+  assert.match(env.queries[1], /^newer_than:14d /);
 });
 
 test('forgets handled emails once they are older than the search window', () => {
@@ -354,7 +424,7 @@ test('setup in the main account creates, configures and shares the calendar', ()
     now: NOW,
     ownedCalendars: [],
     writableCalendars: [],
-    scriptProps: { ANTHROPIC_API_KEY: 'sk-test', SHARE_WITH: 'second@gmail.com, third@gmail.com' },
+    scriptProps: { GROQ_API_KEY: 'gsk-test', SHARE_WITH: 'second@gmail.com, third@gmail.com' },
   });
   env.run('setup()');
 
@@ -394,5 +464,5 @@ test('setup in another account checks it can write to the shared calendar', () =
 
 test('setup asks for the API key first', () => {
   const env = createEnv({ now: NOW, scriptProps: {} });
-  assert.throws(() => env.run('setup()'), /Add ANTHROPIC_API_KEY/);
+  assert.throws(() => env.run('setup()'), /Add GROQ_API_KEY \(free, from console\.groq\.com\)/);
 });

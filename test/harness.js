@@ -90,7 +90,7 @@ function createEnv(options) {
     me: 'me@gmail.com',
     homeTz: 'America/New_York',
     now: Date.UTC(2026, 9, 10, 18, 0),
-    scriptProps: { ANTHROPIC_API_KEY: 'sk-test', CALENDAR_ID: 'cal-main' },
+    scriptProps: { GROQ_API_KEY: 'gsk-test', CALENDAR_ID: 'cal-main' },
     ownedCalendars: ['cal-main'],
     writableCalendars: ['cal-main'],
   }, options);
@@ -107,6 +107,7 @@ function createEnv(options) {
     calendarList: new Map(),
     acl: [],
     triggers: [],
+    sleeps: [],
     scriptProps: Object.assign({}, opts.scriptProps),
     userProps: {},
     nextId: 1,
@@ -213,16 +214,24 @@ function createEnv(options) {
       if (typeof next === 'function') next = next(body);
       if (next && next.throws) throw new Error(next.throws);
       let status = 200;
+      let headers = {};
       let text;
+      const answer = typeof next === 'string' ? next : JSON.stringify(next);
       if (next && next.status) {
         status = next.status;
+        headers = next.headers || {};
         text = typeof next.body === 'string' ? next.body : JSON.stringify(next.body || {});
+      } else if (url.includes('groq.com')) {
+        // OpenAI-style chat completion.
+        text = JSON.stringify({
+          id: 'chatcmpl-test', object: 'chat.completion', model: body.model,
+          choices: [{ index: 0, message: { role: 'assistant', content: answer }, finish_reason: (next && next.finish_reason) || 'stop' }],
+        });
       } else {
-        const content = [{ type: 'thinking', thinking: '', signature: 'sig' }];
-        content.push({ type: 'text', text: typeof next === 'string' ? next : JSON.stringify(next) });
+        const content = [{ type: 'thinking', thinking: '', signature: 'sig' }, { type: 'text', text: answer }];
         text = JSON.stringify({ id: 'msg_test', type: 'message', role: 'assistant', model: body.model, content, stop_reason: (next && next.stop_reason) || 'end_turn' });
       }
-      return { getResponseCode: () => status, getContentText: () => text };
+      return { getResponseCode: () => status, getContentText: () => text, getHeaders: () => headers };
     },
   };
 
@@ -248,6 +257,7 @@ function createEnv(options) {
     Session: { getEffectiveUser: () => ({ getEmail: () => opts.me }) },
     Utilities: {
       formatDate,
+      sleep: (ms) => { env.sleeps.push(ms); env.clock.now += ms; },
       base64Decode: (text) => Array.from(Buffer.from(text, 'base64')).map((b) => (b > 127 ? b - 256 : b)),
       newBlob: (bytes) => ({
         getDataAsString: (charset) => Buffer.from(bytes.map((b) => b & 255))
@@ -282,7 +292,9 @@ function createEnv(options) {
 
   env.run = (source) => vm.runInContext(source, context);
   env.sync = () => env.run('syncInterviews()');
-  env.lastPrompt = () => env.requests[env.requests.length - 1].body.messages[0].content;
+  // The user message: the last one for both Groq (system, user) and Claude (user).
+  env.promptOf = (body) => body.messages[body.messages.length - 1].content;
+  env.lastPrompt = () => env.promptOf(env.requests[env.requests.length - 1].body);
   return env;
 }
 

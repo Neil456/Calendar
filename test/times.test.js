@@ -72,6 +72,7 @@ test('an interview uses the time and zone from its calendar invite', () => {
   assert.equal(ev.summary, 'Stripe: Phone Screen');
   assert.match(ev.description, /Time from: calendar invite, America\/Los_Angeles/);
   assert.match(env.lastPrompt(), /\[Calendar invite\]\nBEGIN:VCALENDAR/);
+  assert.doesNotMatch(env.lastPrompt(), /VALARM|TRIGGER/); // alarms only cost tokens
 });
 
 test('reads Outlook invites from the raw message, with Windows zone names', () => {
@@ -92,6 +93,7 @@ test('reads Outlook invites from the raw message, with Windows zone names', () =
   assert.equal(ev.start.dateTime, '2026-11-02T22:00:00.000Z'); // PST, UTC-8
   assert.equal(ev.summary, 'Acme: Phone Screen'); // exact time, so no ⚠️
   assert.match(env.lastPrompt(), /DTSTART;TZID="Pacific Standard Time":20261102T140000/);
+  assert.doesNotMatch(env.lastPrompt(), /VTIMEZONE/);
 });
 
 test('reads quoted-printable invites and UTC times', () => {
