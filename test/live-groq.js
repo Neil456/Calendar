@@ -1,4 +1,4 @@
-// Live check against the real model: runs the script on 15 realistic emails with fake Gmail
+// Live check against the real model: runs the script on 18 realistic emails with fake Gmail
 // and Calendar but real Groq calls, then checks every event landed at the right moment.
 // Uses about 40K tokens of your Groq allowance.
 //   GROQ_API_KEY=gsk_... npm run live
@@ -58,8 +58,18 @@ const googleInvite = [
   'BEGIN:VTIMEZONE', 'TZID:America/Los_Angeles', 'BEGIN:DAYLIGHT', 'TZOFFSETFROM:-0800', 'TZOFFSETTO:-0700',
   'TZNAME:PDT', 'DTSTART:19700308T020000', 'RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU', 'END:DAYLIGHT', 'END:VTIMEZONE',
   'BEGIN:VEVENT', 'DTSTART;TZID=America/Los_Angeles:20261014T140000', 'DTEND;TZID=America/Los_Angeles:20261014T144500',
+  'UID:7kq2stripe@google.com', 'SEQUENCE:0',
   'SUMMARY:Stripe Phone Screen with Neil', 'LOCATION:https://meet.google.com/abc-defg-hij',
   'BEGIN:VALARM', 'ACTION:EMAIL', 'TRIGGER:-P0DT0H10M0S', 'END:VALARM', 'END:VEVENT', 'END:VCALENDAR',
+].join('\r\n');
+// The same event, moved to Thursday 11am by the organizer (same UID, higher SEQUENCE).
+const googleUpdate = googleInvite
+  .replace('20261014T140000', '20261015T110000').replace('20261014T144500', '20261015T114500')
+  .replace('SEQUENCE:0', 'SEQUENCE:1');
+const coinbaseInvite = (method, sequence) => [
+  'BEGIN:VCALENDAR', `METHOD:${method}`, 'BEGIN:VEVENT', 'UID:cb-889@goodtime.io', `SEQUENCE:${sequence}`,
+  'DTSTART:20261028T170000Z', 'DTEND:20261028T180000Z', 'SUMMARY:Coinbase Technical Interview',
+  method === 'CANCEL' ? 'STATUS:CANCELLED' : 'STATUS:CONFIRMED', 'END:VEVENT', 'END:VCALENDAR',
 ].join('\r\n');
 
 const outlookInvite = [
@@ -82,7 +92,10 @@ const cases = [
   [{ id: 'A', from: 'Google Calendar <calendar-notification@google.com>', subject: 'Invitation: Stripe Phone Screen with Neil @ Wed Oct 14, 2026 2pm - 2:45pm (PDT) (me@gmail.com)',
     body: 'Stripe Phone Screen with Neil\nWednesday Oct 14, 2026 ⋅ 2pm – 2:45pm (Pacific Time - Los Angeles)\nJoin with Google Meet\nmeet.google.com/abc-defg-hij\nOrganizer\nrecruiting@stripe.com\nInvitation from Google Calendar',
     attachments: [{ name: 'invite.ics', type: 'application/ics', data: googleInvite }] },
-  { summary: /Stripe/, start: '2026-10-14T21:00:00.000Z', end: '2026-10-14T21:45:00.000Z' }],
+  { summary: /Stripe/, start: '2026-10-15T18:00:00.000Z', end: '2026-10-15T18:45:00.000Z', note: 'moved by P' }],
+  [{ id: 'P', from: 'Google Calendar <calendar-notification@google.com>', subject: 'Updated invitation: Stripe Phone Screen with Neil @ Thu Oct 15, 2026 11am - 11:45am (PDT) (me@gmail.com)',
+    body: 'This event has been changed.\nStripe Phone Screen with Neil\nChanged: Thursday Oct 15, 2026 ⋅ 11am – 11:45am (Pacific Time - Los Angeles)\nJoin with Google Meet\nmeet.google.com/abc-defg-hij',
+    attachments: [{ name: 'invite.ics', type: 'application/ics', data: googleUpdate }] }, null],
   [{ id: 'B', from: 'Sam Lee <sam@datadoghq.com>', subject: 'Datadog technical interview confirmed',
     body: 'Hi Neil,\n\nThanks for confirming! Your technical interview with Datadog is set for Thursday, October 22nd at 11:00 AM ET. You\'ll meet with Priya (Senior Engineer) for 60 minutes over Zoom: https://datadog.zoom.us/j/9876543210\n\nBest,\nSam\nRecruiting Coordinator | Datadog\nNew York, NY' },
   { summary: /Datadog/, start: '2026-10-23T17:00:00.000Z', note: 'moved by K' }],
@@ -122,6 +135,13 @@ const cases = [
   [{ id: 'O', raw: outlookRaw, from: 'Microsoft Recruiting <recruit@microsoft.com>', subject: 'Microsoft interview',
     body: 'Hi Neil, please find the Teams invite for your Microsoft software engineering interview attached.' },
   { summary: /Microsoft/, start: '2026-11-03T17:00:00.000Z', end: '2026-11-03T18:00:00.000Z' }],
+  [{ id: 'Q', from: 'Coinbase Recruiting via GoodTime <scheduling@goodtime.io>', subject: 'Interview confirmed: Coinbase Technical Interview',
+    body: 'Hi Neil, your Coinbase technical interview is confirmed. Calendar invite attached.',
+    attachments: [{ name: 'invite.ics', type: 'text/calendar', data: coinbaseInvite('REQUEST', 0) }] },
+  { gone: /Coinbase/, note: 'removed by R (cancelled invite)' }],
+  [{ id: 'R', from: 'Coinbase Recruiting via GoodTime <scheduling@goodtime.io>', subject: 'Canceled: Coinbase Technical Interview',
+    body: 'This event has been canceled.',
+    attachments: [{ name: 'invite.ics', type: 'text/calendar', data: coinbaseInvite('CANCEL', 1) }] }, null],
 ];
 
 // Received times: spread over the last 30 hours, in this order. N arrives an hour ago.

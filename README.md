@@ -87,7 +87,7 @@ To update the code, paste the new `Code.js` over `Code.gs` in each account. Your
 npm test
 ```
 
-To check the prompt against the real model with 15 realistic emails (uses about 40K tokens of your Groq allowance):
+To check the prompt against the real model with 18 realistic emails (uses about 40K tokens of your Groq allowance):
 
 ```sh
 GROQ_API_KEY=gsk_... npm run live

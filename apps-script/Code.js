@@ -72,7 +72,7 @@ What to track
 
 Actions
 - create: a new interview or OA deadline that isn't on the calendar yet.
-- update: the email changes an event already on the calendar (reschedule, new link, new length). Use its id and give the full updated details.
+- update: the email changes an event already on the calendar (reschedule, new link, new length). Use its id and give the full updated details. A rescheduled interview is always an update of its existing event, never a second event.
 - remove: an event on the calendar was cancelled, the OA was submitted or completed, or the candidate was rejected or withdrew before it happened. Use its id.
 - Return no actions for everything else: job alerts, newsletters, application receipts, rejections with nothing scheduled, interview tips, thank-you notes, interviews that already happened, and reminders or duplicates of calendar events whose details haven't changed.
 - A multi-session onsite or superday on one day is a single event from the first start to the last end, with the sessions listed in notes. Sessions on different days are separate events.
@@ -218,6 +218,7 @@ function sync_() {
         const email = readEmail_(msg);
         const plan = askModel_(email, events, settings);
         applyPlan_(plan, email, events, settings);
+        applyInviteChanges_(email, events, settings);
         markDone_(state, msg);
       } catch (err) {
         if (err.fatal) throw err;
@@ -440,19 +441,20 @@ function parseInvites_(texts) {
         props = {};
       } else if (/^END:VEVENT/i.test(line) && props) {
         const start = icsTime_(props.DTSTART);
-        if (start) {
-          let end = icsTime_(props.DTEND);
-          const duration = props.DURATION && /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?)?$/i.exec(props.DURATION.value.trim());
-          if (!end && duration) {
-            const minutes = (Number(duration[1] || 0) * 24 + Number(duration[2] || 0)) * 60 + Number(duration[3] || 0);
-            end = { local: addMinutes_(start.local, minutes), tz: start.tz };
-          }
-          invites.push({
-            start: start,
-            end: end,
-            cancelled: cancelledCalendar || /CANCELLED/i.test(props.STATUS ? props.STATUS.value : ''),
-          });
+        let end = start ? icsTime_(props.DTEND) : null;
+        const duration = props.DURATION && /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?)?$/i.exec(props.DURATION.value.trim());
+        if (start && !end && duration) {
+          const minutes = (Number(duration[1] || 0) * 24 + Number(duration[2] || 0)) * 60 + Number(duration[3] || 0);
+          end = { local: addMinutes_(start.local, minutes), tz: start.tz };
         }
+        invites.push({
+          // The UID stays the same when the organizer reschedules; SEQUENCE goes up with each change.
+          uid: props.UID ? props.UID.value.trim() : '',
+          sequence: Number(props.SEQUENCE ? props.SEQUENCE.value : 0) || 0,
+          start: start, // null if the invite doesn't pin the time to a zone
+          end: end,
+          cancelled: cancelledCalendar || /CANCELLED/i.test(props.STATUS ? props.STATUS.value : ''),
+        });
         props = null;
       } else if (props && /^BEGIN:/i.test(line)) {
         nested++; // e.g. a VALARM inside the event
@@ -676,9 +678,11 @@ function applyAction_(a, email, events, settings) {
   }
   const resource = buildEvent_(a, when, email, settings);
 
-  if (a.action === 'update' && index !== -1) {
-    const updated = Calendar.Events.patch(resource, settings.calendarId, a.event_id);
-    events[index] = updated;
+  // An updated invite for an event already on the calendar updates it, even if the model said "create".
+  const target = a.action === 'update' && index !== -1 ? index : findByInvite_(events, when.invite);
+  if (target !== -1) {
+    const updated = Calendar.Events.patch(resource, settings.calendarId, events[target].id);
+    events[target] = updated;
     console.log(`Updated "${updated.summary}" → ${at} (${when.source}): ${a.reason}`);
     return;
   }
@@ -727,6 +731,7 @@ function resolveTimes_(a, email, homeTz) {
       if (invite.end && zonedToDate_(invite.end.local, invite.end.tz) > when.startDate) {
         when.end = apiTime_(invite.end.local, invite.end.tz);
       }
+      when.invite = invite;
       return when;
     }
   }
@@ -756,18 +761,19 @@ function pickInvite_(invites, startLocal, tz) {
   // Gmail often carries the same invite twice (attachment and inline part), so count start times, not copies.
   const seen = {};
   const usable = invites.filter(function (i) {
-    const key = zonedToDate_(i.start.local, i.start.tz).getTime();
-    if (i.cancelled || seen[key]) return false;
+    if (i.cancelled || !i.start) return false;
+    const key = inviteStart_(i).getTime();
+    if (seen[key]) return false;
     seen[key] = true;
     return true;
   });
   if (usable.length <= 1) return usable[0] || null;
   if (!startLocal) return null;
   const target = zonedToDate_(startLocal, tz).getTime();
-  const exact = usable.filter(function (i) { return zonedToDate_(i.start.local, i.start.tz).getTime() === target; });
+  const exact = usable.filter(function (i) { return inviteStart_(i).getTime() === target; });
   if (exact.length) return exact[0];
   const sameDay = usable.filter(function (i) {
-    const day = Utilities.formatDate(zonedToDate_(i.start.local, i.start.tz), javaZone_(tz), 'yyyy-MM-dd');
+    const day = Utilities.formatDate(inviteStart_(i), javaZone_(tz), 'yyyy-MM-dd');
     return day === startLocal.slice(0, 10);
   });
   return sameDay.length === 1 ? sameDay[0] : null;
@@ -793,19 +799,84 @@ function buildEvent_(a, when, email, settings) {
     start: when.start,
     end: when.end,
     reminders: { useDefault: true },
-    extendedProperties: {
-      private: { [TRACKER_TAG]: '1', kind: a.kind, company: company, sourceMessage: email.id },
-    },
+    extendedProperties: { private: inviteTags_(when.invite, { [TRACKER_TAG]: '1', kind: a.kind, company: company, sourceMessage: email.id }) },
   };
+}
+
+/**
+ * Applies updated and cancelled calendar invites directly, matching them to events by the invite's
+ * UID, so a reschedule or cancellation is handled even if the model missed it. An invite at exactly
+ * the time of an event added from the email text gets linked to that event, so later changes to it
+ * are caught too.
+ */
+function applyInviteChanges_(email, events, settings) {
+  email.invites.forEach(function (invite) {
+    if (!invite.uid) return;
+    const index = findByInvite_(events, invite);
+    if (index === -1) {
+      if (invite.cancelled || !invite.start) return;
+      const sameTime = events.filter(function (e) {
+        return tagsOf_(e)[TRACKER_TAG] && startOf_(e) === inviteStart_(invite).getTime();
+      });
+      if (sameTime.length !== 1) return;
+      const linked = Calendar.Events.patch({ extendedProperties: { private: inviteTags_(invite, tagsOf_(sameTime[0])) } },
+        settings.calendarId, sameTime[0].id);
+      events[events.indexOf(sameTime[0])] = linked;
+      return;
+    }
+
+    const event = events[index];
+    if (invite.sequence < Number(tagsOf_(event).inviteSequence || 0)) return; // an older copy of the invite
+    if (invite.cancelled) {
+      Calendar.Events.remove(settings.calendarId, event.id);
+      events.splice(index, 1);
+      console.log(`Removed "${event.summary}": its calendar invite was cancelled.`);
+      return;
+    }
+    if (!invite.start) return;
+    const startDate = inviteStart_(invite);
+    if (startDate.getTime() === startOf_(event) || startDate.getTime() < Date.now()) return;
+    const hasEnd = invite.end && zonedToDate_(invite.end.local, invite.end.tz) > startDate;
+    const moved = Calendar.Events.patch({
+      start: apiTime_(invite.start.local, invite.start.tz),
+      end: hasEnd ? apiTime_(invite.end.local, invite.end.tz)
+        : apiTime_(addMinutes_(invite.start.local, CONFIG.DEFAULT_INTERVIEW_MINUTES), invite.start.tz),
+      extendedProperties: { private: inviteTags_(invite, tagsOf_(event)) },
+    }, settings.calendarId, event.id);
+    events[index] = moved;
+    console.log(`Moved "${event.summary}" to ${formatDate_(startDate, settings.homeTz)} ${settings.homeTz}: its calendar invite was updated.`);
+  });
+}
+
+function inviteTags_(invite, tags) {
+  if (!invite || !invite.uid) return tags;
+  return Object.assign({}, tags, { inviteUid: invite.uid, inviteSequence: String(invite.sequence) });
+}
+
+function findByInvite_(events, invite) {
+  if (!invite || !invite.uid) return -1;
+  return events.findIndex(function (e) { return tagsOf_(e).inviteUid === invite.uid; });
+}
+
+function inviteStart_(invite) {
+  return zonedToDate_(invite.start.local, invite.start.tz);
+}
+
+function tagsOf_(event) {
+  return (event.extendedProperties && event.extendedProperties.private) || {};
+}
+
+function startOf_(event) {
+  return new Date(event.start.dateTime || event.start.date).getTime();
 }
 
 function isDuplicate_(a, when, events) {
   const company = normalize_(a.company);
   return events.some(function (e) {
-    const tags = (e.extendedProperties && e.extendedProperties.private) || {};
-    if (tags.kind !== a.kind || normalize_(tags.company) !== company) return false;
-    const start = new Date(e.start.dateTime || e.start.date).getTime();
-    return Math.abs(start - when.startDate.getTime()) < 60 * 1000;
+    const tags = tagsOf_(e);
+    const other = normalize_(tags.company);
+    const sameCompany = other && company && (other.indexOf(company) !== -1 || company.indexOf(other) !== -1);
+    return tags.kind === a.kind && sameCompany && Math.abs(startOf_(e) - when.startDate.getTime()) < 60 * 1000;
   });
 }
 
