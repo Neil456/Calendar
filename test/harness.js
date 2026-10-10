@@ -20,6 +20,12 @@ function isRealZone(tz) {
 // Utilities.formatDate with the Java-style patterns Code.js uses. Like Apps
 // Script, an unknown zone silently falls back to GMT.
 function formatDate(date, tz, pattern) {
+  // Java-style fixed offsets such as "GMT+05:30".
+  const fixed = /^GMT([+-])(\d{2}):(\d{2})$/.exec(tz);
+  if (fixed) {
+    const minutes = (fixed[1] === '-' ? -1 : 1) * (Number(fixed[2]) * 60 + Number(fixed[3]));
+    return formatDate(new Date(date.getTime() + minutes * 60000), 'UTC', pattern);
+  }
   const zone = isRealZone(tz) ? tz : 'UTC';
   const fmt = new Intl.DateTimeFormat('en-US', {
     timeZone: zone, hourCycle: 'h23', weekday: 'short',
@@ -47,8 +53,21 @@ function instantOf(apiTime) {
   throw new Error(`No such local time ${want} in ${apiTime.timeZone}`);
 }
 
+// A plain-text RFC 822 message unless the test supplies its own raw MIME.
+function rawMessage(m) {
+  return m.raw || [
+    `From: ${m.from}`,
+    `To: ${m.to || 'me@gmail.com'}`,
+    `Subject: ${m.subject}`,
+    'Content-Type: text/plain; charset=UTF-8',
+    '',
+    m.body,
+  ].join('\r\n');
+}
+
 function makeMessage(m) {
   return {
+    getRawContent: () => rawMessage(m),
     getId: () => m.id,
     getFrom: () => m.from,
     getTo: () => m.to || 'me@gmail.com',
@@ -227,7 +246,14 @@ function createEnv(options) {
     },
     LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) },
     Session: { getEffectiveUser: () => ({ getEmail: () => opts.me }) },
-    Utilities: { formatDate },
+    Utilities: {
+      formatDate,
+      base64Decode: (text) => Array.from(Buffer.from(text, 'base64')).map((b) => (b > 127 ? b - 256 : b)),
+      newBlob: (bytes) => ({
+        getDataAsString: (charset) => Buffer.from(bytes.map((b) => b & 255))
+          .toString(/^utf-?8$/i.test(charset || 'UTF-8') ? 'utf8' : 'latin1'),
+      }),
+    },
     ScriptApp: {
       getProjectTriggers: () => env.triggers.map((t) => ({ getHandlerFunction: () => t.handler, _t: t })),
       deleteTrigger: (t) => { env.triggers = env.triggers.filter((x) => x !== t._t); },

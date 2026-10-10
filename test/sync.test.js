@@ -9,7 +9,7 @@ function action(fields) {
   return Object.assign({
     action: 'create', event_id: '', kind: 'interview', company: 'Stripe', title: 'Phone Screen',
     start_local: '2026-10-14T14:00', end_local: '', timezone: 'America/Los_Angeles',
-    timezone_stated: true, location: '', notes: '', reason: 'test',
+    timezone_stated: true, deadline_in_hours: 0, location: '', notes: '', reason: 'test',
   }, fields);
 }
 
@@ -157,7 +157,7 @@ test('emails are processed oldest first', () => {
 
 test('an OA deadline becomes a zero-length event at the deadline', () => {
   const env = createEnv({ now: NOW });
-  env.addThread(email({ from: 'no-reply@hackerrank.com', subject: 'Jane Street assessment' }));
+  env.addThread(email({ from: 'no-reply@hackerrank.com', subject: 'Jane Street assessment', body: 'Please complete it by October 17 at 11:59 PM PT.' }));
   env.reply({ actions: [action({ kind: 'oa_deadline', company: 'Jane Street', title: 'Online Assessment', start_local: '2026-10-17T23:59', location: 'https://hr.com/test/abc' })] });
   env.sync();
 
@@ -187,6 +187,7 @@ test('a missing time zone falls back to home time and is flagged', () => {
   env.sync();
 
   const [ev] = env.eventList();
+  assert.equal(env.requests.length, 1);
   assert.equal(ev.summary, '⚠️ Stripe: Phone Screen');
   assert.match(ev.description, /⚠️ The email didn't say which time zone, so assumed America\/New_York\. Check the email to confirm\./);
   assert.equal(ev.start.dateTime, '2026-10-14T18:00:00.000Z');
@@ -206,16 +207,18 @@ test('an unreadable time zone falls back to home time and is flagged', () => {
 
 test('past events, duplicates, bad times and unknown ids are handled safely', () => {
   const env = createEnv({ now: NOW });
-  env.addThread(email({}), email({ id: 'm2', date: NOW - HOUR / 2 }));
-  env.reply({ actions: [
+  env.addThread(email({}), email({ id: 'm2', date: NOW - HOUR / 2, body: 'Acme: Tuesday, October 20 at 9:00 AM PT' }));
+  const first = { actions: [
     action({}),
     action({ company: 'Old Co', start_local: '2026-10-01T10:00' }), // already happened
     action({ company: ' stripe ' }), // same interview again
-    action({ company: 'Bad Co', start_local: 'next Tuesday' }),
-  ] });
+    action({ company: 'Bad Co', start_local: 'next Tuesday' }), // unusable
+  ] };
+  env.reply(first);
   env.reply({ actions: [
     action({ action: 'remove', event_id: 'nope' }),
-    action({ action: 'update', event_id: 'nope', company: 'Acme', start_local: '2026-10-20T09:00' }), // treated as new
+    // Unknown id: treated as new.
+    action({ action: 'update', event_id: 'nope', company: 'Acme', start_local: '2026-10-20T09:00' }),
   ] });
   env.sync();
 
@@ -226,8 +229,9 @@ test('past events, duplicates, bad times and unknown ids are handled safely', ()
 
 test('at most 5 changes are made per email', () => {
   const env = createEnv({ now: NOW });
-  env.addThread(email({}));
-  env.reply({ actions: [1, 2, 3, 4, 5, 6, 7].map((d) => action({ start_local: `2026-10-1${d}T10:00` })) });
+  const days = [1, 2, 3, 4, 5, 6, 7];
+  env.addThread(email({ body: days.map((d) => `Session ${d}: October 1${d} at 10:00 AM PT`).join('\n') }));
+  env.reply({ actions: days.map((d) => action({ start_local: `2026-10-1${d}T10:00` })) });
   env.sync();
   assert.equal(env.eventList().length, 5);
 });
@@ -252,7 +256,7 @@ test('includes .ics invites and trims very long emails', () => {
   env.sync();
   const prompt = env.lastPrompt();
   assert.match(prompt, /x{15000}\n\[\.\.\. rest of email cut for length \.\.\.\]/);
-  assert.match(prompt, /\[Calendar invite invite\.ics\]\nBEGIN:VCALENDAR\nDTSTART;TZID=America\/Los_Angeles:20261014T140000\n<\/email>$/);
+  assert.match(prompt, /\n\[Calendar invite\]\nBEGIN:VCALENDAR\nDTSTART;TZID=America\/Los_Angeles:20261014T140000\n<\/email>$/);
   assert.doesNotMatch(prompt, /resume\.pdf/);
 });
 

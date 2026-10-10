@@ -13,7 +13,13 @@ A small Google Apps Script runs inside each Gmail account. Every 10 minutes it s
 
 Your phone gets the alerts because the calendar has default notifications of 1 day and 1 hour. Those defaults cover every event, including events added from your other accounts.
 
-**Time zones:** Claude reports the time exactly as the email wrote it, along with that email's time zone (for example `2:00 PM` + `America/Los_Angeles`). Google Calendar does the conversion, including daylight saving, and your phone shows the time in whatever zone you're in. If an email doesn't say a time zone, the event is added in your home time zone and its title starts with ⚠️ so you know to double-check it.
+**Time zones:** an event's time comes from the most reliable source the email has:
+
+1. **A calendar invite.** Most interview confirmations include one, from Google, Outlook, Teams or a scheduling tool. The event uses the invite's exact time and time zone.
+2. **A relative OA deadline** such as "expires in 72 hours". It's counted from the moment the email arrived.
+3. **Otherwise, the email text.** Claude reports the time exactly as written, along with its time zone (for example `2:00 PM` + `America/Los_Angeles`).
+
+In every case Google Calendar does the conversion, including daylight saving, and your phone shows the time in whatever zone you're in. If an email doesn't say a time zone, the event uses your home time zone and its title starts with ⚠️ so you know to check it. Each event's description says where its time came from.
 
 ## Setup (about 10 minutes)
 
