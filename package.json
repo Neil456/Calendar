@@ -3,6 +3,7 @@
   "private": true,
   "description": "Adds interviews and OA deadlines from Gmail to a Google Calendar.",
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "live": "node test/live-groq.js"
   }
 }

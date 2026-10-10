@@ -205,7 +205,7 @@ function createEnv(options) {
   };
 
   const UrlFetchApp = {
-    fetch: (url, params) => {
+    fetch: opts.fetch || ((url, params) => {
       const body = JSON.parse(params.payload);
       env.requests.push({ url, headers: params.headers, body, params });
       if (env.onRequest) env.onRequest(body);
@@ -232,7 +232,7 @@ function createEnv(options) {
         text = JSON.stringify({ id: 'msg_test', type: 'message', role: 'assistant', model: body.model, content, stop_reason: (next && next.stop_reason) || 'end_turn' });
       }
       return { getResponseCode: () => status, getContentText: () => text, getHeaders: () => headers };
-    },
+    }),
   };
 
   const record = (level) => (...args) => env.logs.push(`${level}: ${args.join(' ')}`);
@@ -257,7 +257,7 @@ function createEnv(options) {
     Session: { getEffectiveUser: () => ({ getEmail: () => opts.me }) },
     Utilities: {
       formatDate,
-      sleep: (ms) => { env.sleeps.push(ms); env.clock.now += ms; },
+      sleep: (ms) => { env.sleeps.push(ms); env.clock.now += ms; if (opts.realSleep) opts.realSleep(ms); },
       base64Decode: (text) => Array.from(Buffer.from(text, 'base64')).map((b) => (b > 127 ? b - 256 : b)),
       newBlob: (bytes) => ({
         getDataAsString: (charset) => Buffer.from(bytes.map((b) => b & 255))
